@@ -1,0 +1,267 @@
+====================================================================================
+RNA-seq 完整分析流程
+样本：WT / Jhd2_N437A × KAc0 / KAc1 （酵母）
+分析步骤：质控 → 过滤 → 比对 → 定量 → DESeq2差异分析 → 热图/箱线图/KEGG/火山图/GSEA
+====================================================================================
+
+1. make_directory.sh （创建目录）
+#!/bin/sh
+mkdir 1.rawdata 2.cleandata 3.qc_results 4.aligned_bam 5.rmdup_bam 6.featureCounts 7.figures 8.results
+
+2. FastQC.sh （原始数据质控）
+#!/bin/sh
+for i in *.gz
+do
+fastqc $i -t 24 -o ../3.qc_results
+done
+
+3. Trim_filter.sh （去接头、质量过滤）
+#!/bin/sh
+cat config |while read id
+do
+arr=($id)
+fq1=${arr[0]}
+fq2=${arr[1]}
+trim_galore -q 25 --phred33 --stringency 3 -e 0.1 \
+--gzip --length 50 --cores 8 \
+--paired -o ../2.cleandata $fq1 $fq2
+done
+
+4. STAR_align.sh （比对到酵母基因组）
+#!/bin/sh
+cat config |while read id
+do
+arr=($id)
+fq1=${arr[0]}
+fq2=${arr[1]}
+STAR --runThreadN 40 \
+--genomeDir /public/home/ty/index/STAR_saccer3 \
+--readFilesIn $fq1 $fq2 \
+--readFilesCommand zcat \
+--outSAMtype BAM SortedByCoordinate \
+--outFileNamePrefix ../4.aligned_bam/${id%%.*}
+done
+
+5. Remove_duplicates.sh （去PCR重复）
+#!/bin/sh
+for i in ../4.aligned_bam/*.bam
+do
+nohup samtools rmdup $i ../5.rmdup_bam/rm_${i##*/} &
+done
+
+6. samtools_index.sh （建索引）
+#!/bin/sh
+ls ../5.rmdup_bam/*.bam | xargs -i samtools index {}
+
+7. featureCounts.sh （基因定量 → 输出 allgene_counts.txt）
+#!/bin/sh
+featureCounts -T 20 -p -t exon -g gene_id \
+-a /public/home/ty/gtf/saccer.gtf \
+-o ../6.featureCounts/allgene_counts.txt \
+../5.rmdup_bam/*.bam
+
+7.featureCounts 需要两个输入文件：
+featureCounts -T 5 -p -t exon -g gene_id -a ~/reference/gtf/gencode.v30.annotation.gtf -o ~/all.id.txt ~/4.mapping/*.bam
+
+
+
+==================== 【二、R 语言流程：从 counts 到所有文章图表】 ====================
+==== 以下代码直接在 R/RStudio 运行，生成：差异基因 + 热图 + 箱线图 + KEGG + 火山图 + GSEA ====
+
+# 清空环境
+rm(list=ls())
+gc()
+
+# 加载包
+library(DESeq2)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(pheatmap)
+library(clusterProfiler)
+library(org.Sc.sgd.db)
+library(enrichplot)
+library(ggpubr)
+
+# 工作目录
+setwd("H:/R-relate/RNA-Seq_WT_Jhd2_N437A")
+
+#===========================================================================
+# 1. 读入 counts & 构建 DESeq2 对象
+#===========================================================================
+rawCount <- read.table("allgene_counts.txt", row.names=1, header=T)[,-c(1:5)]
+rawCount <- rawCount[rowSums(rawCount[,1:12])>length(colnames(rawCount)),]
+
+condition <- factor(rep(c("KAc0","KAc1"),each=3,times=2), levels=c("KAc0","KAc1"))
+genetype <- factor(rep(c("Jhd2_N437A","WT"),each=6),levels=c("WT","Jhd2_N437A"))
+colData <- data.frame(row.names=colnames(rawCount), genetype, condition)
+
+dds <- DESeqDataSetFromMatrix(countData=rawCount, colData=colData,
+                              design=~condition+genetype+genetype:condition)
+dds <- DESeq(dds)
+resultsNames(dds)
+
+#===========================================================================
+# 2. 差异基因分析（4组对比）
+#===========================================================================
+WT.KAc1_vs_KAc0 <- data.frame(results(dds, contrast=c("condition","KAc1","KAc0")))
+Jhd2_N437A.KAc1_vs_KAc0 <- data.frame(results(dds, contrast=list("condition_KAc1_vs_KAc0","genetype_Jhd2_N437A_vs_WT")))
+KAc0.Jhd2_N437A_vs_WT <- data.frame(results(dds, contrast=c("genetype","Jhd2_N437A","WT")))
+KAc1.Jhd2_N437A_vs_WT <- data.frame(results(dds, contrast=list(c("genetype_Jhd2_N437A_vs_WT","conditionKAc1.genetypeJhd2_N437A"))))
+
+write.csv(WT.KAc1_vs_KAc0,        "../8.results/WT.KAc1_vs_KAc0.csv", row.names=T)
+write.csv(Jhd2_N437A.KAc1_vs_KAc0,"../8.results/Jhd2_N437A.KAc1_vs_KAc0.csv", row.names=T)
+write.csv(KAc0.Jhd2_N437A_vs_WT,  "../8.results/KAc0.Jhd2_N437A_vs_WT.csv", row.names=T)
+write.csv(KAc1.Jhd2_N437A_vs_WT,  "../8.results/KAc1.Jhd2_N437A_vs_WT.csv", row.names=T)
+
+mergr.DF <- data.frame(
+  WT.KAc = WT.KAc1_vs_KAc0$log2FoldChange,
+  Jhd2_N437A.KAc = Jhd2_N437A.KAc1_vs_KAc0$log2FoldChange,
+  KAc0.Jhd2_N437A = KAc0.Jhd2_N437A_vs_WT$log2FoldChange,
+  KAc1.Jhd2_N437A = KAc1.Jhd2_N437A_vs_WT$log2FoldChange
+)
+rownames(mergr.DF) <- rownames(WT.KAc1_vs_KAc0)
+
+#===========================================================================
+# 3. 提取 KEGG 通路基因
+#===========================================================================
+geneset <- read.csv("./pathway_and_kegg.csv", header=T)
+
+Oxidative.phosphorylation <- geneset$Oxidative.phosphorylation
+Oxidative.phosphorylation <- subset(mergr.DF, rownames(mergr.DF) %in% Oxidative.phosphorylation)
+Oxidative.phosphorylation <- Oxidative.phosphorylation[order(Oxidative.phosphorylation$WT.KAc, decreasing=T),]
+
+Citrate.cycle <- geneset$Citrate.cycle
+Citrate.cycle.DF <- subset(mergr.DF, rownames(mergr.DF) %in% Citrate.cycle)
+Citrate.cycle.DF <- Citrate.cycle.DF[order(Citrate.cycle.DF$Jhd2_N437A.KAc, decreasing=T),]
+
+#===========================================================================
+# 4. TPM 计算 + KEGG 通路热图
+#===========================================================================
+Counts2TPM <- function(counts, len){
+  rate <- log(counts) - log(len/1000)
+  denom <- log(sum(exp(rate)))
+  exp(rate - denom + log(1e6))
+}
+
+rawCount <- read.table("allgene_counts.txt", row.names=1, header=T)[,-c(1:4)]
+len <- rawCount$Length
+rawCount <- rawCount[,2:13]
+rawCount <- rawCount[rowSums(rawCount)!=0,]
+rawCount.tpm <- data.frame(apply(rawCount, 2, function(x) Counts2TPM(x, len[rownames(rawCount)])))
+
+TCA    <- geneset$Citrate.cycle
+PPP    <- geneset$Pentose.phosphate.pathway
+Oxidative <- geneset$Oxidative.phosphorylation
+Glycolysis <- geneset$Glycolysis.Gluconeogenesis
+
+TCA.tpm    <- rawCount.tpm[rownames(rawCount.tpm) %in% TCA,]
+Glycolysis.tpm <- rawCount.tpm[rownames(rawCount.tpm) %in% Glycolysis,]
+PPP.tpm    <- rawCount.tpm[rownames(rawCount.tpm) %in% PPP,]
+Oxidative.tpm <- rawCount.tpm[rownames(rawCount.tpm) %in% Oxidative,]
+
+TCA.tpm <- TCA.tpm[order(TCA.tpm$N1_jia.bam, decreasing=T),]
+PPP.tpm <- PPP.tpm[order(PPP.tpm$N1_jia.bam, decreasing=T),]
+Oxidative.tpm <- Oxidative.tpm[order(Oxidative.tpm$N1_jia.bam, decreasing=T),]
+Glycolysis.tpm <- Glycolysis.tpm[order(Glycolysis.tpm$N1_jia.bam, decreasing=T),]
+
+DF <- rbind(TCA.tpm, Oxidative.tpm, Glycolysis.tpm, PPP.tpm)
+DF <- DF[,c(7:9,4:6,10:12,1:3)]
+
+annotation_col <- data.frame(
+  Genetype = rep(c("Jhd2_N437A","WT"),each=6),
+  Condition = rep(c("KAc0","KAc1"),each=3,times=2)
+)
+rownames(annotation_col) <- colnames(DF)
+
+annotation_row <- data.frame(
+  pathway = c(rep("TCA",nrow(TCA.tpm)), rep("Oxidative",nrow(Oxidative.tpm)),
+              rep("Glycolysis",nrow(Glycolysis.tpm)), rep("PPP",nrow(PPP.tpm)))
+)
+rownames(annotation_row) <- rownames(DF)
+
+ann_colors <- list(
+  Condition = c(KAc0="#00A0E9", KAc1="#E60012"),
+  Genetype = c(WT="#D95F02", Jhd2_N437A="#1B9E77"),
+  pathway = c(TCA="#E41A1C",Oxidative="#4DAF4A",Glycolysis="#984EA3",PPP="#377EB8")
+)
+
+bk <- seq(-2,2,length.out=100)
+
+p <- pheatmap(DF, scale="row", cluster_rows=F, cluster_cols=F,
+              show_rownames=F, show_colnames=T,
+              annotation_col=annotation_col, annotation_row=annotation_row,
+              annotation_colors=ann_colors,
+              color=c(colorRampPalette(c("blue","white"))(50),colorRampPalette(c("white","red"))(50)),
+              breaks=bk, gaps_col=6,
+              gaps_row=c(nrow(TCA.tpm), nrow(TCA.tpm)+nrow(Oxidative.tpm), nrow(TCA.tpm)+nrow(Oxidative.tpm)+nrow(Glycolysis.tpm)),
+              main="KEGG Pathways Heatmap")
+
+ggsave("../7.figures/Heatmap_KEGG.png", p, width=10, height=15, dpi=720)
+
+#===========================================================================
+# 5. 箱线图
+#===========================================================================
+Box.DF <- data.frame(Jhd2_N437A = rowMeans(TCA.tpm[,1:3]))
+Box.DF$gene <- rownames(Box.DF)
+Box.DF.TCA <- subset(Box.DF, gene %in% geneset$Oxidative.phosphorylation)
+long_df <- melt(Box.DF.TCA, id.vars="gene")
+
+box <- ggplot(long_df, aes(x=variable, y=log2(value+1), fill=variable)) +
+  geom_violin(trim=F, color="white", width=0.6) +
+  geom_boxplot(width=0.1, color="black", outlier.size=0.1) +
+  scale_fill_manual(values=c("#00A0E9","#E60012","grey","green")) +
+  theme_bw() + ylab("TCA gene Log2FC") + xlab("")
+
+ggsave("../7.figures/Boxplot_TPM.svg", box, width=10, height=8, dpi=300)
+
+#===========================================================================
+# 6. KEGG 富集分析
+#===========================================================================
+deg <- na.omit(KAc1.Jhd2_N437A_vs_WT)
+deg$type <- ifelse(deg$pvalue<0.05 & abs(deg$log2FoldChange)>1, "sig","nosig")
+deg_sig <- subset(deg, type=="sig")
+gene_list <- rownames(deg_sig)
+
+eg <- bitr(gene_list, fromType="ENSEMBL", toType="ENTREZID", OrgDb=org.Sc.sgd.db)
+kk <- enrichKEGG(gene=eg$ENTREZID, organism="sce", pvalueCutoff=0.05)
+write.csv(as.data.frame(kk), "../8.results/KEGG_result.csv", row.names=F)
+
+png("../7.figures/KEGG_barplot.png", w=1200, h=800)
+par(mar=c(8,20,2,2))
+y <- -log10(kk$pvalue)
+names(y) <- kk$Description
+barplot(sort(y), horiz=T, las=1, col=rainbow(length(y)), xlab="-log10(Pvalue)")
+dev.off()
+
+#===========================================================================
+# 7. 火山图
+#===========================================================================
+volcano_df <- na.omit(KAc1.Jhd2_N437A_vs_WT)
+volcano <- ggplot(volcano_df, aes(x=log2FoldChange, y=-log10(pvalue))) +
+  geom_point(alpha=0.5, size=0.5) +
+  geom_hline(yintercept=-log10(0.05), lty=4) +
+  geom_vline(xintercept=c(-1,1), lty=4) +
+  theme_bw() + xlab("log2FC") + ylab("-log10(Pvalue)")
+
+ggsave("../7.figures/Volcano.png", volcano, width=8, height=6, dpi=300)
+
+#===========================================================================
+# 8. GSEA 分析
+#===========================================================================
+gsea_df <- na.omit(KAc1.Jhd2_N437A_vs_WT)
+genelist <- gsea_df$log2FoldChange
+names(genelist) <- rownames(gsea_df)
+genelist <- sort(genelist, decreasing=T)
+
+gseakegg <- gseKEGG(geneList=genelist, organism="sce", pvalueCutoff=0.1)
+write.csv(as.data.frame(gseakegg), "../8.results/GSEA_result.csv", row.names=F)
+
+if(nrow(gseakegg)>0){
+  gsea_plot <- gseaplot2(gseakegg, geneSetID=2, title=gseakegg$Description[2], color="green")
+  ggsave("../7.figures/GSEA_plot.pdf", gsea_plot, width=10, height=7)
+}
+
+#===========================================================================
+# 分析完成
