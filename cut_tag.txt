@@ -1,0 +1,125 @@
+CUT&Tag 标准分析流程
+
+1.make_directory.sh  创建分析目录
+#!/bin/sh
+mkdir 1.rawdata 2.cleandata 3.qc_results 4.aligned_bam 5.rmdup_bam 6.filter_bam 7.macs2_peaks 8.bigwig 9.peak_anno 10.figures
+
+2.FastQC.sh  原始下机数据质控
+#!/bin/sh
+for i in *.gz
+do
+~/miniconda3/envs/py3.7/bin/fastqc $i -t 24 -o ../3.qc_results;
+done
+
+3.Trim_filter.sh  去接头、质量过滤
+#!/bin/sh
+cat config |while read id 
+do
+        arr=($id)
+        fq1=${arr[0]}
+        fq2=${arr[1]}
+~/miniconda3/envs/py3.7/bin/trim_galore -q 25 --phred33 --stringency 3 -e 0.1 --gzip --clip_R1 9 --clip_R2 9 --length 50 --cores 8  --paired -o ../2.cleandata  $fq1 $fq2 
+done
+
+4.bowtie2AlignPE.Yeast.sh  酵母基因组比对
+#!/bin/sh 
+cat config |while read id ;
+do
+arr=($id);
+fq1=${arr[0]};
+fq2=${arr[1]};
+~/miniconda3/bin/bowtie2 -x  /public/home/ty/index/saccer  -p 100  -1 $fq1 -2 $fq2   | ~/miniconda3/bin/samtools sort -@ 100 -O bam -o ../4.aligned_bam/${id%%.*}.bam ;
+done
+
+5.samtool.index.sh  所有bam建索引
+#!/bin/sh
+ls ../4.aligned_bam/*.bam | xargs -i samtools index {}
+
+6.Remove_duplicates.sh  去除PCR重复
+#!/bin/sh
+for i in ../4.aligned_bam/*.bam; do
+  nohup ~/biosoft/samtools/bin/samtools rmdup "$i" "../5.rmdup_bam/rm$i" &
+done
+
+7.Filter_bam.sh  过滤低质量、多重比对、线粒体reads
+#!/bin/sh
+for bam in ../5.rmdup_bam/*.bam
+do
+name=`basename $bam`
+samtools view -h -q 30 $bam | grep -v chrM | samtools sort -@ 20 -O bam -o ../6.filter_bam/filter_${name}
+samtools index ../6.filter_bam/filter_${name}
+done
+
+8.macs2_callpeak.sh  MACS2 找富集峰
+#!/bin/sh
+# -t 处理组 -c 对照组 input
+for i in ../6.filter_bam/*.bam
+do
+sample=`basename $i .bam`
+macs2 callpeak -c ../6.filter_bam/filter_input.bam -t $i -g 1.2e7 -n ${sample} -p 0.05 --nomodel --extsize 200 -o ../7.macs2_peaks
+done
+
+9.bamCoverage.sh  生成bigwig用于IGV/热图
+#!/bin/sh
+for bam in ../6.filter_bam/*.bam
+do
+name=${bam##*/}
+bamCoverage -b $bam \
+-o ../8.bigwig/${name%.bam}.bw \
+--binSize 10 \
+--normalizeUsing CPM \
+-p 20
+done
+
+10.computeMatrix_plotHeatmap.sh  蛋白结合峰全局热图
+#!/bin/sh
+# 以基因上下游1000bp为例
+computeMatrix scale-regions \
+-S ../8.bigwig/sample1.bw ../8.bigwig/sample2.bw \
+-R /public/home/ty/chip_seq/tongyue/index/allGene.bed \
+-b 1000 -a 1000 \
+-o ../10.figures/peak_matrix.gz \
+--missingDataAsZero --skipZeros -p 50
+
+plotHeatmap -m ../10.figures/peak_matrix.gz \
+-o ../10.figures/peak_heatmap.pdf \
+--heatmapHeight 15 --heatmapWidth 6 \
+--zMin -1.5 --zMax 1.5 \
+--colorList "#00a0e9,white,#e60012" --perGroup
+
+==================== 二、R语言后续分析与绘图 ====================
+# 工作目录自行修改
+setwd("H:/R-relate/CutTag_analysis")
+
+library(ChIPseeker)
+library(clusterProfiler)
+library(org.Sc.sgd.db)
+library(ggplot2)
+library(dplyr)
+library(pheatmap)
+
+# 1. 峰文件读入与注释
+peak1 <- readPeakFile("../7.macs2_peaks/filter_sample1_peaks.narrowPeak")
+peak2 <- readPeakFile("../7.macs2_peaks/filter_sample2_peaks.narrowPeak")
+
+# 酵母注释gtf
+txdb <- makeTxDbFromGFF("/public/home/ty/gtf/saccer.gtf")
+peakAnno1 <- annotatePeak(peak1, tssRegion=c(-1000,1000), TxDb=txdb, annoDb="org.Sc.sgd.db")
+peakAnno2 <- annotatePeak(peak2, tssRegion=c(-1000,1000), TxDb=txdb, annoDb="org.Sc.sgd.db")
+
+write.csv(as.data.frame(peakAnno1),"peakAnno_sample1.csv",row.names=F)
+write.csv(as.data.frame(peakAnno2),"peakAnno_sample2.csv",row.names=F)
+
+# 2. 提取峰关联基因，KEGG富集
+gene1 <- as.data.frame(peakAnno1)$geneId
+gene2 <- as.data.frame(peakAnno2)$geneId
+
+ekegg1 <- enrichKEGG(gene = gene1, organism = "sce", pvalueCutoff = 0.05)
+ekegg2 <- enrichKEGG(gene = gene2, organism = "sce", pvalueCutoff = 0.05)
+
+write.csv(as.data.frame(ekegg1),"KEGG_sample1.csv",row.names=F)
+write.csv(as.data.frame(ekegg2),"KEGG_sample2.csv",row.names=F)
+
+====================================================================================
+Cut&Tag 完整分析流程结束
+====================================================================================
