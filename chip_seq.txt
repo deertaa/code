@@ -1,0 +1,59 @@
+1.make_directory.sh 
+#!/bin/sh 
+mkdir 1.rawdata 2.cleandata 3.qc_results 4.orign_bam_files 5.duplicates_removed_files 6.macs2_peaks_files 7.motif_files
+
+2.FastQC.sh
+#!/bin/sh 
+for i in *.gz
+do 
+~/miniconda3/envs/py3.7/bin/fastqc $i -t 24 -o ../3.qc_results;
+done
+
+3.Trim_filter.sh
+#!/bin/sh 
+cat config |while read id 
+do
+        arr=($id)
+        fq1=${arr[0]}
+        fq2=${arr[1]}
+~/miniconda3/envs/py3.7/bin/trim_galore -q 25 --phred33 --stringency 3 -e 0.1 --gzip --clip_R1 9 --clip_R2 9 --length 60 --cores 8  --paired -o ../2.cleandata  $fq1 $fq2 
+done
+
+4.bowtie2AlignPE.Yeast.sh
+#!/bin/sh 
+cat config |while read id ;
+do
+arr=($id);
+fq1=${arr[0]};
+fq2=${arr[1]};
+~/miniconda3/bin/bowtie2 -x  /public/home/ty/index/saccer  -p 100  -1 $fq1 -2 $fq2   | ~/miniconda3/bin/samtools sort -@ 100 -O bam -o ${id%%.*}.bam ;
+done
+
+5.Remove_duplicates.sh
+#!/bin/sh
+# 循环处理所有bam，后台运行
+for i in *.bam; do
+  nohup ~/biosoft/samtools/bin/samtools rmdup "$i" "../5.duplicates_removed_files/rm$i" &
+done
+
+6.samtool.index.sh
+ls *.bam | xargs -i samtools index {}
+
+7.macs2 callpeaks 寻找峰
+macs2 callpeak -c rminput_set1_1.fastq.gz.sam.bam -t $i -g 1.2e7 -n $i -p 0.05 --nomodel  
+
+8. bamCompare bam 文件转换为bw文件
+bamCompare -b1 treatment.bam -b2 control.bam -o log2_log_A.bw --scaleFactorsMethod readCount --binSize 10 --operation log2 -p 20 --smoothLength 60   ##  酵母
+
+bamCompare -b1 treatment.bam -b2 control.bam  -o log2_log_A.bw --scaleFactorsMethod readCount --binSize 100 --operation log2 -p 20 --smoothLength 100   ## 细胞
+
+
+9. computeMatrix 绘图
+computeMatrix scale-regions -S log2_log_A.bw log2_shift_A.bw -R /public/home/ty/chip_seq/tongyue/index/allGene.bed -b 1000 -a 1000 -o log_shift_A.gz --missingDataAsZero  --skipZeros -p 50
+
+10. plotHeatmap 画分布图
+plotHeatmap -m log_shift.gz -o log_shift.pdf --heatmapHeight 15 --heatmapWidth 6 --zMin -1.5 --zMax 1.5 --colorList "#00a0e9,white,#e60012" --perGroup  
+
+
+
+
